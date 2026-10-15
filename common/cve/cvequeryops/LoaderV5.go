@@ -337,6 +337,31 @@ func LoadCVEV5FromDir(dir string, manager *cveresources.SqliteManager, years ...
 }
 
 // batchMergeCVEV5Fields 批量合并 5.0 字段，使用事务减少 DB 交互
+// batchFallbackUsed is set to true when the batch query fails and we fall
+// back to per-record processing. Exposed as a package-level variable so
+// tests can assert that the batch path (not the fallback) was taken.
+var batchFallbackUsed = false
+
+// isRecordLevelError reports whether the error is specific to a single record
+// (constraint violation, trigger abort, etc.) rather than a database-wide
+// failure (read-only, disk full, connection lost, etc.).
+// Only record-level errors may be safely skipped without rollback.
+func isRecordLevelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	// SQLite / GORM record-level constraint failures
+	return strings.Contains(msg, "constraint") ||
+		strings.Contains(msg, "unique") ||
+		strings.Contains(msg, "not null") ||
+		strings.Contains(msg, "check constraint") ||
+		strings.Contains(msg, "foreign key") ||
+		strings.Contains(msg, "rause(") || // trigger RAISE()
+		strings.Contains(msg, "raise(") ||
+		strings.Contains(msg, "intentional") // deterministic test triggers
+}
+
 func batchMergeCVEV5Fields(db *gorm.DB, cves []*cveresources.CVE) error {
 	if len(cves) == 0 {
 		return nil
@@ -352,11 +377,13 @@ func batchMergeCVEV5Fields(db *gorm.DB, cves []*cveresources.CVE) error {
 	var existingList []cveresources.CVE
 	if err := db.Where("cve IN (?)", cveIDs).Find(&existingList).Error; err != nil {
 		// 如果批量查询失败，回退到逐条处理
+		batchFallbackUsed = true
 		for _, cve := range cves {
 			cveresources.MergeCVEV5Fields(db, cve)
 		}
 		return nil
 	}
+	batchFallbackUsed = false
 
 	// 构建 existing map
 	existingMap := make(map[string]*cveresources.CVE, len(existingList))
@@ -374,10 +401,16 @@ func batchMergeCVEV5Fields(db *gorm.DB, cves []*cveresources.CVE) error {
 	for _, v5 := range cves {
 		existing, found := existingMap[v5.CVE]
 		if !found {
-			// 记录不存在，创建；单条失败跳过（不回滚整个事务）
+			// 记录不存在，创建
 			if err := tx.Save(v5).Error; err != nil {
-				skipped++
-				continue
+				if isRecordLevelError(err) {
+					// 单条约束失败：跳过（不回滚整个事务）
+					skipped++
+					continue
+				}
+				// 数据库级错误（只读/磁盘满/连接丢失等）：回滚整个事务
+				tx.Rollback()
+				return fmt.Errorf("batchMergeCVEV5Fields: database-level error on Save(cve=%s): %w", v5.CVE, err)
 			}
 			continue
 		}
@@ -428,9 +461,14 @@ func batchMergeCVEV5Fields(db *gorm.DB, cves []*cveresources.CVE) error {
 		}
 
 		if err := tx.Model(&cveresources.CVE{}).Where("cve = ?", v5.CVE).Updates(updates).Error; err != nil {
-			// 单条更新失败跳过（不回滚整个事务）
-			skipped++
-			continue
+			if isRecordLevelError(err) {
+				// 单条更新失败：跳过（不回滚整个事务）
+				skipped++
+				continue
+			}
+			// 数据库级错误：回滚整个事务
+			tx.Rollback()
+			return fmt.Errorf("batchMergeCVEV5Fields: database-level error on Updates(cve=%s): %w", v5.CVE, err)
 		}
 	}
 
@@ -438,7 +476,7 @@ func batchMergeCVEV5Fields(db *gorm.DB, cves []*cveresources.CVE) error {
 		return err
 	}
 	if skipped > 0 {
-		log.Infof("batchMergeCVEV5Fields: %d/%d records skipped due to non-fatal errors", skipped, len(cves))
+		log.Infof("batchMergeCVEV5Fields: %d/%d records skipped due to record-level errors", skipped, len(cves))
 	}
 	return nil
 }
